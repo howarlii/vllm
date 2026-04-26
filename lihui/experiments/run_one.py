@@ -7,7 +7,7 @@ Two independent strategy axes:
                                             — KV-transfer connector choice
 
 PCIe byte signals emitted to CSV:
-  external_kv_transfer_tokens       from scheduler.connector_prefix_cache_stats
+  external_kv_transfer_tokens       from RequestOutput.num_external_computed_tokens
   pcie_bytes_restore_estimate       external_kv_transfer_tokens × kv_bytes_per_token
   pcie_nvml_bytes_{tx,rx,total}     NVML PCIe throughput integration (if --nvml-sample)
   pcie_*_bandwidth_gb_per_s         average and peak PCIe bandwidth (GB/s)
@@ -43,12 +43,12 @@ def _parse_capacity(spec: str):
 
 def _actual_hbm_capacity_spec(metrics) -> str:
     """Render the engine-created HBM KV cache capacity as concrete space."""
-    capacity_bytes = int(getattr(metrics, "hbm_capacity_bytes", 0) or 0)
+    capacity_bytes = int(metrics.hbm_capacity_bytes)
     if capacity_bytes > 0:
         return f"{capacity_bytes / (1024 ** 3):.3f}GB"
 
-    capacity_tokens = int(getattr(metrics, "hbm_capacity_tokens", 0) or 0)
-    bytes_per_token = int(getattr(metrics, "pcie_kv_bytes_per_token", 0) or 0)
+    capacity_tokens = int(metrics.hbm_capacity_tokens)
+    bytes_per_token = int(metrics.pcie_kv_bytes_per_token)
     if capacity_tokens > 0 and bytes_per_token > 0:
         capacity_gb = capacity_tokens * bytes_per_token / (1024 ** 3)
         return f"{capacity_gb:.3f}GB"
@@ -215,7 +215,7 @@ def main() -> None:
     )
 
     metrics = compute_run_metrics(state)
-    actual_page_size = int(getattr(state, "block_size", page_size) or page_size)
+    actual_page_size = int(state.block_size)
     hbm_capacity_spec = _actual_hbm_capacity_spec(metrics)
     row = {
         # Dataset / request-prep args.
@@ -225,7 +225,6 @@ def main() -> None:
         "words_per_min": args.words_per_min,
         "tokenizer": args.tokenizer,
         "seed": args.seed,
-        "tokenize_workers": args.tokenize_workers,
         "max_requests": args.max_requests,
         "requested_page_size": args.page_size,
         "page_size": actual_page_size,
@@ -271,7 +270,8 @@ def main() -> None:
         f"(cap={metrics.hbm_capacity_tokens} tokens)\n"
         f"  dram_peak={metrics.dram_peak_cached_tokens} "
         f"dram_avg={metrics.dram_avg_cached_tokens:.1f}\n"
-        f"  external_tokens={metrics.external_kv_transfer_tokens} "
+        f"  restore_tokens={metrics.external_kv_transfer_tokens} "
+        f"avg_restore={metrics.avg_restore_tokens_per_req:.3f} "
         f"bpt={metrics.pcie_kv_bytes_per_token}\n"
         f"  pcie: est={metrics.pcie_bytes_restore_estimate/1e6:.1f} MB  "
         f"nvml={metrics.pcie_nvml_bytes_total/1e6:.1f} MB "

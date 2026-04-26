@@ -19,8 +19,8 @@ Two axes:
 
 Metrics collected per run:
   * Native HBM prefix-cache hits (from scheduler.kv_cache_manager.prefix_cache_stats)
-  * Connector DRAM prefix-cache hits (from scheduler.connector_prefix_cache_stats)
-  * Per-request num_cached_tokens (total, local+external)
+  * Connector DRAM prefix-cache hits (from RequestOutput.num_external_computed_tokens)
+  * Per-request num_cached_tokens (total, local + external)
   * Optional: NVML PCIe tx/rx byte integration around each generate()
 """
 
@@ -29,7 +29,6 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
 
 from src.nvml_util import PcieSampler
 from src.request_generator import TokenizedRequest
@@ -65,11 +64,14 @@ class PerRequestTrace:
 
 @dataclass
 class RunState:
-    traces: List[PerRequestTrace] = field(default_factory=list)
-    hbm_cache_token_samples: List[int] = field(default_factory=list)
-    dram_cache_token_samples: List[int] = field(default_factory=list)
+    traces: list[PerRequestTrace] = field(default_factory=list)
+    hbm_cache_token_samples: list[int] = field(default_factory=list)
+    dram_cache_token_samples: list[int] = field(default_factory=list)
     block_size: int = 0
+    # Logical token capacity after vLLM's block/layer grouping.
     hbm_capacity_tokens: int = 0
+    # Profiled KV memory budget in bytes, matching vLLM's
+    # "Available KV cache memory" log line.
     hbm_capacity_bytes: int = 0
 
     # PCIe byte estimates, two independent sources.
@@ -100,10 +102,10 @@ def _build_llm_kwargs(
     block_size: int,
     hbm_strategy: str,
     dram_strategy: str,
-    hbm_capacity_gb: Optional[float],
+    hbm_capacity_gb: float | None,
     cpu_capacity_gb: float,
     dtype: str,
-    max_model_len: Optional[int],
+    max_model_len: int | None,
     gpu_memory_utilization: float,
     enforce_eager: bool,
     tensor_parallel_size: int,
@@ -111,11 +113,13 @@ def _build_llm_kwargs(
 ) -> dict:
     if hbm_strategy not in _VALID_HBM_STRATEGIES:
         raise ValueError(
-            f"Unknown hbm_strategy {hbm_strategy!r}; expected one of {_VALID_HBM_STRATEGIES}"
+            f"Unknown hbm_strategy {hbm_strategy!r}; "
+            f"expected one of {_VALID_HBM_STRATEGIES}"
         )
     if dram_strategy not in _VALID_DRAM_STRATEGIES:
         raise ValueError(
-            f"Unknown dram_strategy {dram_strategy!r}; expected one of {_VALID_DRAM_STRATEGIES}"
+            f"Unknown dram_strategy {dram_strategy!r}; "
+            f"expected one of {_VALID_DRAM_STRATEGIES}"
         )
     if dram_strategy == "lmcache":
         raise NotImplementedError(
@@ -183,26 +187,20 @@ def _build_llm_kwargs(
 def _scheduler(llm):
     try:
         return llm.llm_engine.engine_core.engine_core.scheduler  # type: ignore[attr-defined]
-    except AttributeError:
-        return None
+    except AttributeError as exc:
+        raise RuntimeError(
+            "Failed to read vLLM in-process scheduler. "
+            "Ensure VLLM_ENABLE_V1_MULTIPROCESSING=0 is honored."
+        ) from exc
 
 
 def _block_pool(scheduler):
     try:
         return scheduler.kv_cache_manager.block_pool
-    except Exception:
-        return None
-
-
-def _block_pool_snapshot(scheduler) -> int:
-    """Currently-used GPU block count."""
-    bp = _block_pool(scheduler)
-    if bp is None:
-        return 0
-    try:
-        return int(bp.num_gpu_blocks) - int(bp.get_num_free_blocks())
-    except Exception:
-        return 0
+    except AttributeError as exc:
+        raise RuntimeError(
+            "Failed to read scheduler.kv_cache_manager.block_pool"
+        ) from exc
 
 
 def _logical_cache_tokens_from_block_pool(block_pool, block_size: int) -> int:
@@ -212,28 +210,19 @@ def _logical_cache_tokens_from_block_pool(block_pool, block_size: int) -> int:
     the same logical prefix block for multiple groups, so count unique
     BlockHash values rather than raw map entries or transient block occupancy.
     """
-    if block_pool is None:
-        return 0
     try:
-        token_granularity = int(
-            getattr(block_pool, "hash_block_size", block_size) or block_size
-        )
+        token_granularity = int(block_pool.hash_block_size)
         cache_map = block_pool.cached_block_hash_to_block
-        raw_cache = getattr(cache_map, "_cache", None)
-        if raw_cache is None:
-            return int(len(cache_map)) * token_granularity
+        raw_cache = cache_map._cache
 
         from vllm.v1.core.kv_cache_utils import get_block_hash  # type: ignore
 
-        logical_hashes = set()
-        for key in raw_cache:
-            try:
-                logical_hashes.add(get_block_hash(key))
-            except Exception:
-                logical_hashes.add(key)
+        logical_hashes = {get_block_hash(key) for key in raw_cache}
         return len(logical_hashes) * token_granularity
-    except Exception:
-        return 0
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "Failed to read logical cached tokens from vLLM BlockPool"
+        ) from exc
 
 
 def _hbm_logical_cache_tokens(scheduler, block_size: int) -> int:
@@ -241,14 +230,21 @@ def _hbm_logical_cache_tokens(scheduler, block_size: int) -> int:
 
 
 def _dram_block_pool(scheduler):
+    if scheduler.connector is None:
+        return None
     try:
         return scheduler.connector.scheduler_manager.cpu_block_pool
-    except Exception:
-        return None
+    except AttributeError as exc:
+        raise RuntimeError(
+            "Failed to read scheduler.connector.scheduler_manager.cpu_block_pool"
+        ) from exc
 
 
 def _dram_logical_cache_tokens(scheduler, block_size: int) -> int:
-    return _logical_cache_tokens_from_block_pool(_dram_block_pool(scheduler), block_size)
+    block_pool = _dram_block_pool(scheduler)
+    if block_pool is None:
+        return 0
+    return _logical_cache_tokens_from_block_pool(block_pool, block_size)
 
 
 def _hbm_logical_capacity_tokens(scheduler) -> int:
@@ -259,75 +255,44 @@ def _hbm_logical_capacity_tokens(scheduler) -> int:
     pool blocks. Match vLLM's own "GPU KV cache size" accounting instead of
     reporting raw BlockPool capacity.
     """
-    if scheduler is None:
-        return 0
     try:
         cfg = scheduler.kv_cache_manager.kv_cache_config
         groups = cfg.kv_cache_groups
         if not groups:
-            return 0
+            raise RuntimeError("vLLM kv_cache_config.kv_cache_groups is empty")
         min_block_size = min(
             int(group.kv_cache_spec.block_size) for group in groups
         )
         num_tokens = int(cfg.num_blocks) // len(groups) * min_block_size
 
-        vllm_config = getattr(scheduler, "vllm_config", None)
-        if vllm_config is not None:
-            parallel_config = vllm_config.parallel_config
-            cp_size = (
-                int(parallel_config.prefill_context_parallel_size)
-                * int(parallel_config.decode_context_parallel_size)
-            )
-            if cp_size > 1:
-                num_tokens *= cp_size
+        parallel_config = scheduler.vllm_config.parallel_config
+        cp_size = (
+            int(parallel_config.prefill_context_parallel_size)
+            * int(parallel_config.decode_context_parallel_size)
+        )
+        if cp_size > 1:
+            num_tokens *= cp_size
         return num_tokens
-    except Exception:
-        return 0
+    except AttributeError as exc:
+        raise RuntimeError("Failed to read logical HBM KV cache capacity") from exc
 
 
-def _resolved_block_size(llm, scheduler, fallback: int) -> int:
-    """Best-effort readout of the block size actually used by vLLM."""
+def _resolved_block_size(scheduler) -> int:
+    """Read the block size actually used by vLLM."""
     try:
         cfg = scheduler.kv_cache_manager.kv_cache_config
         block_sizes = [
             int(g.kv_cache_spec.block_size) for g in cfg.kv_cache_groups
         ]
-        if block_sizes:
-            return min(block_sizes)
-    except Exception:
-        pass
-    try:
-        ec = llm.llm_engine.engine_core.engine_core
-        return int(ec.vllm_config.cache_config.block_size)
-    except Exception:
-        return int(fallback)
-
-
-def _stats_snapshot(scheduler):
-    """Return cumulative hit/query counters without resetting them."""
-    out = {"native_hits": 0, "native_queries": 0,
-           "connector_hits": 0, "connector_queries": 0}
-    if scheduler is None:
-        return out
-    try:
-        pcs = scheduler.kv_cache_manager.prefix_cache_stats
-        if pcs is not None:
-            out["native_hits"] = int(pcs.hits)
-            out["native_queries"] = int(pcs.queries)
-    except Exception:
-        pass
-    try:
-        cpc = scheduler.connector_prefix_cache_stats
-        if cpc is not None:
-            out["connector_hits"] = int(cpc.hits)
-            out["connector_queries"] = int(cpc.queries)
-    except Exception:
-        pass
-    return out
+        if not block_sizes:
+            raise RuntimeError("vLLM kv_cache_config.kv_cache_groups is empty")
+        return min(block_sizes)
+    except AttributeError as exc:
+        raise RuntimeError("Failed to read resolved vLLM block size") from exc
 
 
 def _kv_bytes_per_token_from_engine(llm) -> int:
-    """Best-effort readout of per-token KV footprint from the engine config.
+    """Read per-token KV footprint from the engine config.
 
     Sums bytes-per-block across all KV cache groups (attention + mamba) as
     declared in `kv_cache_config.kv_cache_groups[i].kv_cache_spec`, then
@@ -341,31 +306,56 @@ def _kv_bytes_per_token_from_engine(llm) -> int:
         # All groups in a hybrid model share the same aligned block size; grab
         # it from the first spec.
         first_spec = cfg.kv_cache_groups[0].kv_cache_spec
-        block_size = int(getattr(first_spec, "block_size", 0))
+        block_size = int(first_spec.block_size)
         if block_size <= 0:
-            return 0
+            raise RuntimeError(f"Invalid vLLM KV cache block_size={block_size}")
         total_bytes_per_block = 0
         for g in cfg.kv_cache_groups:
-            total_bytes_per_block += int(getattr(g.kv_cache_spec, "page_size_bytes", 0) or 0)
+            total_bytes_per_block += int(g.kv_cache_spec.page_size_bytes)
+        if total_bytes_per_block <= 0:
+            raise RuntimeError(
+                f"Invalid total KV bytes per block={total_bytes_per_block}"
+            )
         return total_bytes_per_block // block_size
-    except Exception:
-        return 0
+    except (AttributeError, IndexError) as exc:
+        raise RuntimeError("Failed to read per-token KV footprint from vLLM") from exc
+
+
+def _available_kv_cache_memory_bytes_from_engine(llm) -> int:
+    """Read vLLM's profiled KV cache memory budget in bytes.
+
+    This is the same value reported by vLLM as "Available KV cache memory".
+    It is a memory budget from profiling or kv_cache_memory_bytes, not the
+    allocatable logical token capacity after block/layer grouping.
+    """
+    try:
+        ec = llm.llm_engine.engine_core.engine_core  # InprocClient -> EngineCore
+        available_bytes = int(ec.available_gpu_memory_for_kv_cache)
+        if available_bytes < 0:
+            raise RuntimeError(
+                f"Invalid available KV cache memory={available_bytes}"
+            )
+        return available_bytes
+    except AttributeError as exc:
+        raise RuntimeError(
+            "Failed to read available KV cache memory from vLLM"
+        ) from exc
 
 
 # ── Main driver ─────────────────────────────────────────────────────────────
 
 
 def run_live(
-    requests: List[TokenizedRequest],
+    requests: list[TokenizedRequest],
     *,
     model: str,
     block_size: int,
     hbm_strategy: str,
     dram_strategy: str,
-    hbm_capacity_gb: Optional[float] = None,
+    hbm_capacity_gb: float | None = None,
     cpu_capacity_gb: float = 8.0,
     dtype: str = "auto",
-    max_model_len: Optional[int] = None,
+    max_model_len: int | None = None,
     gpu_memory_utilization: float = 0.9,
     enforce_eager: bool = True,
     tensor_parallel_size: int = 1,
@@ -373,7 +363,7 @@ def run_live(
     max_gen_tokens: int = 1,
     nvml_sample: bool = False,
     nvml_interval_s: float = 0.05,
-    extra_llm_kwargs: Optional[dict] = None,
+    extra_llm_kwargs: dict | None = None,
     progress: bool = True,
 ) -> RunState:
     """Run a list of tokenized requests through a live vLLM engine, serially.
@@ -406,20 +396,21 @@ def run_live(
     sp = SamplingParams(max_tokens=max_gen_tokens, temperature=0.0)
 
     scheduler = _scheduler(llm)
-    block_size = _resolved_block_size(llm, scheduler, block_size)
+    block_size = _resolved_block_size(scheduler)
     bpt_engine = _kv_bytes_per_token_from_engine(llm)
     hbm_capacity_tokens = _hbm_logical_capacity_tokens(scheduler)
+    hbm_capacity_bytes = _available_kv_cache_memory_bytes_from_engine(llm)
 
     state = RunState(
         block_size=block_size,
         hbm_capacity_tokens=hbm_capacity_tokens,
-        hbm_capacity_bytes=hbm_capacity_tokens * bpt_engine,
+        hbm_capacity_bytes=hbm_capacity_bytes,
         pcie_kv_bytes_per_token=bpt_engine,
         engine_hbm_strategy=hbm_strategy,
         engine_dram_strategy=dram_strategy,
     )
 
-    sampler: Optional[PcieSampler] = None
+    sampler: PcieSampler | None = None
     if nvml_sample:
         sampler = PcieSampler(interval_s=nvml_interval_s)
         sampler.start()
@@ -434,7 +425,9 @@ def run_live(
         try:
             from tqdm import tqdm
             iterator = tqdm(
-                requests, desc=f"vLLM[hbm={hbm_strategy}|dram={dram_strategy}]", unit="req"
+                requests,
+                desc=f"vLLM[hbm={hbm_strategy}|dram={dram_strategy}]",
+                unit="req",
             )
         except ImportError:
             pass
@@ -455,10 +448,14 @@ def run_live(
             # RequestOutput carries the first-schedule prefix-cache snapshot.
             # Scheduler prefix_cache_stats are consumed/reset by vLLM's logger,
             # so reading them here races with periodic engine logging.
-            cached_total = int(getattr(out, "num_cached_tokens", 0) or 0)
-            d_connector = int(
-                getattr(out, "num_external_computed_tokens", 0) or 0
-            )
+            if out.num_cached_tokens is None:
+                raise RuntimeError("RequestOutput.num_cached_tokens is None")
+            if out.num_external_computed_tokens is None:
+                raise RuntimeError(
+                    "RequestOutput.num_external_computed_tokens is None"
+                )
+            cached_total = int(out.num_cached_tokens)
+            d_connector = int(out.num_external_computed_tokens)
             cached_total = min(input_tokens, cached_total)
             d_connector = min(cached_total, d_connector)
             d_native = cached_total - d_connector

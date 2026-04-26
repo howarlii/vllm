@@ -3,7 +3,7 @@
 Simulator-only columns (FLOP counts, wall-clock breakdowns, branch stats,
 per-request saved-time percentiles) are dropped. Additional columns for
 the DRAM-tier picture are added:
-  * external_kv_transfer_tokens        — tokens served by connector (lossless)
+  * external_kv_transfer_tokens        — tokens restored by the connector
   * pcie_bytes_restore_estimate        — external tokens × bytes_per_token
   * pcie_nvml_bytes_tx/rx/total        — NVML hardware PCIe throughput
                                           integrated over the run (if enabled)
@@ -17,7 +17,7 @@ the DRAM-tier picture are added:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Optional
+from typing import Any
 
 from src.vllm_runner import RunState
 
@@ -36,12 +36,14 @@ class RunMetrics:
     # ── Tokens by source ────────────────────────────────────────────────────
     load_tokens: int = 0
     compute_tokens: int = 0
-    load_compute_ratio: Optional[float] = None
+    load_compute_ratio: float | None = None
     external_kv_transfer_tokens: int = 0
 
-    # ── Logical prefix-cache residency ──────────────────────────────────────
+    # ── Prefix-cache residency and HBM KV capacity ─────────────────────────
     peak_cached_tokens: int = 0
     avg_cached_tokens: float = 0.0
+    # Token capacity is logical; byte capacity is vLLM's profiled KV memory
+    # budget, matching the "Available KV cache memory" log line.
     hbm_capacity_tokens: int = 0
     hbm_capacity_bytes: int = 0
 
@@ -49,7 +51,7 @@ class RunMetrics:
     dram_peak_cached_tokens: int = 0
     dram_avg_cached_tokens: float = 0.0
     avg_promoted_tokens_per_req: float = 0.0
-    avg_demoted_tokens_per_req: float = 0.0
+    avg_restore_tokens_per_req: float = 0.0
 
     # ── PCIe transfer bytes (three independent signals) ─────────────────────
     # (1) Token-based estimate — only the DRAM→HBM restore half, exact in
@@ -67,7 +69,7 @@ class RunMetrics:
     # (3) Canonical — NVML total if sampled, else the restore-only estimate.
     pcie_total_transfer_bytes: int = 0
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -81,8 +83,15 @@ def compute_run_metrics(state: RunState) -> RunMetrics:
     compute_tokens = sum(t.miss_tokens for t in traces)
     hbm_hit = sum(t.hbm_hit_tokens for t in traces)
     dram_hit = sum(t.dram_hit_tokens for t in traces)
+    restore_tokens = dram_hit
+    if int(state.pcie_external_tokens) != restore_tokens:
+        raise RuntimeError(
+            "Inconsistent external restore token accounting: "
+            f"state.pcie_external_tokens={state.pcie_external_tokens}, "
+            f"sum(trace.dram_hit_tokens)={restore_tokens}"
+        )
 
-    lcr: Optional[float]
+    lcr: float | None
     lcr = None if compute_tokens == 0 else float(load_tokens / compute_tokens)
 
     hbm_samples = state.hbm_cache_token_samples
@@ -94,15 +103,16 @@ def compute_run_metrics(state: RunState) -> RunMetrics:
     dram_avg = sum(dram_samples) / len(dram_samples) if dram_samples else 0.0
 
     bpt = int(state.pcie_kv_bytes_per_token)
-    restore_est = int(state.pcie_external_tokens) * bpt
+    restore_est = restore_tokens * bpt
     nvml_tx = int(state.nvml_pcie_tx_bytes)
     nvml_rx = int(state.nvml_pcie_rx_bytes)
     nvml_total = nvml_tx + nvml_rx
 
-    if state.nvml_available and nvml_total > 0:
-        canonical = nvml_total
-    else:
-        canonical = restore_est
+    canonical = (
+        nvml_total
+        if state.nvml_available and nvml_total > 0
+        else restore_est
+    )
 
     bandwidth_window_s = (
         float(state.nvml_sampling_duration_s)
@@ -125,7 +135,7 @@ def compute_run_metrics(state: RunState) -> RunMetrics:
         load_tokens=load_tokens,
         compute_tokens=compute_tokens,
         load_compute_ratio=lcr,
-        external_kv_transfer_tokens=int(state.pcie_external_tokens),
+        external_kv_transfer_tokens=restore_tokens,
         peak_cached_tokens=hbm_peak,
         avg_cached_tokens=hbm_avg,
         hbm_capacity_tokens=state.hbm_capacity_tokens,
@@ -133,7 +143,7 @@ def compute_run_metrics(state: RunState) -> RunMetrics:
         dram_peak_cached_tokens=dram_peak,
         dram_avg_cached_tokens=dram_avg,
         avg_promoted_tokens_per_req=0.0,
-        avg_demoted_tokens_per_req=float(state.pcie_external_tokens) / n_req,
+        avg_restore_tokens_per_req=float(restore_tokens) / n_req,
         pcie_bytes_restore_estimate=restore_est,
         pcie_kv_bytes_per_token=bpt,
         pcie_nvml_bytes_tx=nvml_tx,

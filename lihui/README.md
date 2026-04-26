@@ -62,7 +62,7 @@ individually is perfect; cross-reference in analysis.
 
 | CSV column                          | Source                                                                              | Covers           | Accuracy                                |
 |-------------------------------------|-------------------------------------------------------------------------------------|------------------|-----------------------------------------|
-| `external_kv_transfer_tokens`       | `scheduler.connector_prefix_cache_stats.hits`                                       | restore only     | **exact** in tokens                    |
+| `external_kv_transfer_tokens`       | per-request `RequestOutput.num_external_computed_tokens` trace                     | restore only     | **exact** in tokens                    |
 | `pcie_kv_bytes_per_token`           | derived from `KVCacheSpec.page_size_bytes / block_size` at runtime                  | —                | model-exact                             |
 | `pcie_bytes_restore_estimate`       | `external_kv_transfer_tokens × pcie_kv_bytes_per_token`                             | restore only     | exact modulo derivation                 |
 | `pcie_nvml_bytes_{tx,rx,total}`     | `nvmlDeviceGetPcieThroughput` integrated at 50 ms intervals in a background thread | tx+rx, all traffic | ground truth (incl. weights / activations) |

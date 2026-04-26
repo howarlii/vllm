@@ -78,7 +78,7 @@ RESULT_CSV_FIELDS: List[str] = [
     "dram_peak_cached_tokens",
     "dram_avg_cached_tokens",
     "avg_promoted_tokens_per_req",
-    "avg_demoted_tokens_per_req",
+    "avg_restore_tokens_per_req",
     # ── PCIe transfer bytes ─────────────────────────────────────────────
     "pcie_kv_bytes_per_token",
     "pcie_bytes_restore_estimate",
