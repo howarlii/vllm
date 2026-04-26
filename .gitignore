@@ -8,6 +8,7 @@ vllm/vllm_flash_attn/*
 
 # OpenAI triton kernels copied from source
 vllm/third_party/triton_kernels/*
+vllm/third_party/
 
 # FlashMLA interface copied from source
 vllm/third_party/flashmla/flash_mla_interface.py
@@ -239,5 +240,5 @@ vllm/grpc/vllm_engine_pb2.py
 vllm/grpc/vllm_engine_pb2_grpc.py
 vllm/grpc/vllm_engine_pb2.pyi
 
-# Ignore generated cpu headers 
+# Ignore generated cpu headers
 csrc/cpu/cpu_attn_dispatch_generated.h

@@ -302,9 +302,24 @@ class Scheduler(SchedulerInterface):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
-        assert num_external_computed_tokens == 0, (
-            "External KV connector is not verified yet"
+        # assert num_external_computed_tokens == 0, (
+        #     "External KV connector is not verified yet"
+        # )
+        if num_external_computed_tokens > 0:
+            logger.warning_once(
+                "External KV connector is not verified yet. "
+                "(current implemented by LH)"
+            )
+        block_size = self.cache_config.block_size
+        assert num_new_local_computed_tokens % block_size == 0, (
+            "num_new_local_computed_tokens must be a multiple of block_size"
         )
+        if num_new_local_computed_tokens % block_size != 0:
+            logger.warning(
+                "num_new_local_computed_tokens (%d) is not a multiple of block_size (%d)",
+                num_new_local_computed_tokens,
+                block_size,
+            )
         num_computed_tokens = (
             request.num_computed_tokens
             + num_new_local_computed_tokens
@@ -332,7 +347,23 @@ class Scheduler(SchedulerInterface):
             num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
             if num_computed_tokens_after_sched < last_cache_position:
                 # align to block_size
-                num_new_tokens = num_new_tokens // block_size * block_size
+                # num_new_tokens = num_new_tokens // block_size * block_size
+                num_new_tokens_old = num_new_tokens
+                num_new_tokens = max(0, num_computed_tokens_after_sched // block_size * block_size - num_computed_tokens)
+                if num_external_computed_tokens > 0:
+                    logger.debug(f"_mamba_block_aligned_split trace the num_new_tokens {num_new_tokens_old} -> {num_new_tokens}. "
+                                 f"num_computed_tokens {request.num_computed_tokens}, num_new_local_computed_tokens {num_new_local_computed_tokens}"
+                                 f", num_external_computed_tokens{num_external_computed_tokens}"
+                                 )
+                # Align the end position to block_size when this step can
+                # produce a new full Mamba cache block. If the current step
+                # cannot even reach the next block boundary, allow the partial
+                # progress; no new full block will be cached.
+                # next_cache_position = (
+                #     (num_computed_tokens + block_size - 1) // block_size * block_size
+                # )
+                # if num_computed_tokens_after_sched >= next_cache_position:
+                #     num_new_tokens = next_cache_position - num_computed_tokens
             elif (
                 num_computed_tokens
                 < last_cache_position
@@ -705,8 +736,8 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens,
                         num_external_computed_tokens,
                     )
-                    if num_new_tokens == 0:
-                        break
+                    # if num_new_tokens == 0:
+                    #     break
 
                 # Handles an edge case when P/D Disaggregation
                 # is used with Spec Decoding where an
